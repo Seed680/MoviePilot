@@ -1,7 +1,6 @@
 import copy
 import json
 import os
-import re
 import secrets
 import sys
 import threading
@@ -25,7 +24,7 @@ class ConfigModel(BaseModel):
         extra = "ignore"  # 忽略未定义的配置项
 
     # 项目名称
-    PROJECT_NAME = "MoviePilot"
+    PROJECT_NAME: str = "MoviePilot"
     # 域名 格式；https://movie-pilot.org
     APP_DOMAIN: str = ""
     # API路径
@@ -86,7 +85,7 @@ class ConfigModel(BaseModel):
     AUXILIARY_AUTH_ENABLE: bool = False
     # API密钥，需要更换
     API_TOKEN: Optional[str] = None
-    # 网络代理 IP:PORT
+    # 网络代理服务器地址
     PROXY_HOST: Optional[str] = None
     # 登录页面电影海报,tmdb/bing/mediaserver
     WALLPAPER: str = "tmdb"
@@ -124,9 +123,11 @@ class ConfigModel(BaseModel):
     # 元数据识别缓存过期时间（小时）
     META_CACHE_EXPIRE: int = 0
     # 电视剧动漫的分类genre_ids
-    ANIME_GENREIDS = [16]
+    ANIME_GENREIDS: List[int] = [16]
     # 用户认证站点
     AUTH_SITE: str = ""
+    # 重启自动升级
+    MOVIEPILOT_AUTO_UPDATE: str = 'release'
     # 自动检查和更新站点资源包（站点索引、认证等）
     AUTO_UPDATE_RESOURCE: bool = True
     # 是否启用DOH解析域名
@@ -202,7 +203,7 @@ class ConfigModel(BaseModel):
     # CookieCloud同步黑名单，多个域名,分割
     COOKIECLOUD_BLACKLIST: Optional[str] = None
     # CookieCloud对应的浏览器UA
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36 Edg/113.0.1774.57"
+    USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36 Edg/113.0.1774.57"
     # 电影重命名格式
     MOVIE_RENAME_FORMAT: str = "{{title}}{% if year %} ({{year}}){% endif %}" \
                                "/{{title}}{% if year %} ({{year}}){% endif %}{% if part %}-{{part}}{% endif %}{% if videoFormat %} - {{videoFormat}}{% endif %}" \
@@ -253,36 +254,34 @@ class ConfigModel(BaseModel):
     # 编码探测的最低置信度阈值
     ENCODING_DETECTION_MIN_CONFIDENCE: float = 0.8
     # 允许的图片缓存域名
-    SECURITY_IMAGE_DOMAINS: List[str] = Field(
-        default_factory=lambda: ["image.tmdb.org",
-                                 "static-mdb.v.geilijiasu.com",
-                                 "bing.com",
-                                 "doubanio.com",
-                                 "lain.bgm.tv",
-                                 "raw.githubusercontent.com",
-                                 "github.com",
-                                 "thetvdb.com",
-                                 "cctvpic.com",
-                                 "iqiyipic.com",
-                                 "hdslb.com",
-                                 "cmvideo.cn",
-                                 "ykimg.com",
-                                 "qpic.cn"]
-    )
+    SECURITY_IMAGE_DOMAINS: list = Field(default=[
+        "image.tmdb.org",
+        "static-mdb.v.geilijiasu.com",
+        "bing.com",
+        "doubanio.com",
+        "lain.bgm.tv",
+        "raw.githubusercontent.com",
+        "github.com",
+        "thetvdb.com",
+        "cctvpic.com",
+        "iqiyipic.com",
+        "hdslb.com",
+        "cmvideo.cn",
+        "ykimg.com",
+        "qpic.cn"
+    ])
     # 允许的图片文件后缀格式
-    SECURITY_IMAGE_SUFFIXES: List[str] = Field(
-        default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"]
-    )
+    SECURITY_IMAGE_SUFFIXES: list = Field(default=[".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"])
     # 重命名时支持的S0别名
-    RENAME_FORMAT_S0_NAMES: List[str] = Field(
-        default_factory=lambda: ["Specials", "SPs"]
-    )
+    RENAME_FORMAT_S0_NAMES: list = Field(default=["Specials", "SPs"])
     # 启用分词搜索
     TOKENIZED_SEARCH: bool = False
     # 为指定默认字幕添加.default后缀
     DEFAULT_SUB: Optional[str] = "zh-cn"
     # Docker Client API地址
     DOCKER_CLIENT_API: Optional[str] = "tcp://127.0.0.1:38379"
+    # 剧集交集最小置信度  计算后的交集比例( len(torrent_episodes ∩ need_episodes) / len(torrent_episodes) 低于这个阈值表明包含过多不需要的剧集
+    EPISODE_INTERSECTION_MIN_CONFIDENCE: float = 0.0
 
 
 class Settings(BaseSettings, ConfigModel, LogConfigModel):
@@ -329,6 +328,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                                raise_exception: bool = False) -> Tuple[Any, bool]:
         """
         通用类型转换函数，根据预期类型转换值。如果转换失败，返回默认值
+        :return: 元组 (转换后的值, 是否需要更新)
         """
         if isinstance(value, (list, dict, set)):
             value = copy.deepcopy(value)
@@ -369,12 +369,8 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                     converted = float(value)
                     return converted, str(converted) != str(original_value)
             elif expected_type is str:
-                # 清理 value 中所有空白字符的字段
-                fields_not_keep_spaces = {"AUTO_DOWNLOAD_USER", "REPO_GITHUB_TOKEN", "PLUGIN_MARKET"}
-                if field_name in fields_not_keep_spaces:
-                    value = re.sub(r"\s+", "", value)
-                return value, str(value) != str(original_value)
-            # 支持 list 类型的处理
+                converted = str(value).strip()
+                return converted, converted != str(original_value)
             elif expected_type is list:
                 if isinstance(value, list):
                     return value, str(value) != str(original_value)
@@ -384,7 +380,6 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                         return items, items != original_value
                     else:
                         return items, str(items) != str(original_value)
-            # 可根据需要添加更多类型处理
             else:
                 return value, str(value) != str(original_value)
         except (ValueError, TypeError) as e:
@@ -436,9 +431,12 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                 logger.info(f"配置项 '{field.name}' 已自动修正并写入到 'app.env' 文件")
         return True, message
 
-    def update_setting(self, key: str, value: Any) -> Tuple[bool, str]:
+    def update_setting(self, key: str, value: Any) -> Tuple[Optional[bool], str]:
         """
         更新单个配置项
+        :param key: 配置项的名称
+        :param value: 配置项的新值
+        :return: (是否成功 True 成功/False 失败/None 无需更新, 错误信息)
         """
         if not hasattr(self, key):
             return False, f"配置项 '{key}' 不存在"
@@ -449,8 +447,11 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             if field.name == "API_TOKEN":
                 converted_value, needs_update = self.validate_api_token(value, original_value)
             else:
-                converted_value, needs_update = self.generic_type_converter(value, original_value, field.type_,
-                                                                            field.default, key)
+                converted_value, needs_update = self.generic_type_converter(value,
+                                                                            original_value,
+                                                                            field.type_,
+                                                                            field.default,
+                                                                            key)
             # 如果没有抛出异常，则统一使用 converted_value 进行更新
             if needs_update or str(value) != str(converted_value):
                 success, message = self.update_env_config(field, value, converted_value)
@@ -460,30 +461,17 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                     if hasattr(log_settings, key):
                         setattr(log_settings, key, converted_value)
                 return success, message
-            return True, ""
+            return None, ""
         except Exception as e:
             return False, str(e)
 
-    def update_settings(self, env: Dict[str, Any]) -> Dict[str, Tuple[bool, str]]:
+    def update_settings(self, env: Dict[str, Any]) -> Dict[str, Tuple[Optional[bool], str]]:
         """
         更新多个配置项
         """
         results = {}
-        log_updated, plugin_monitor_updated = False, False
         for k, v in env.items():
             results[k] = self.update_setting(k, v)
-            if hasattr(log_settings, k):
-                log_updated = True
-            if k in ["PLUGIN_AUTO_RELOAD", "DEV"]:
-                plugin_monitor_updated = True
-        # 本次更新存在日志配置项更新，需要重新加载日志配置
-        if log_updated:
-            logger.update_loggers()
-        # 本次更新存在插件监控配置项更新，需要重新加载插件监控
-        if plugin_monitor_updated:
-            # 解决顶层循环导入问题
-            from app.core.plugin import PluginManager
-            PluginManager().reload_monitor()
         return results
 
     @property
@@ -540,7 +528,8 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             "tmdb": "TMDB请求缓存数量",
             "douban": "豆瓣请求缓存数量",
             "fanart": "Fanart请求缓存数量",
-            "meta": "元数据缓存过期时间（秒）"
+            "meta": "元数据缓存过期时间（秒）",
+            "memory": "最大占用内存（MB）"
         }
         """
         if self.BIG_MEMORY_MODE:
@@ -551,7 +540,8 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                 "douban": 512,
                 "bangumi": 512,
                 "fanart": 512,
-                "meta": (self.META_CACHE_EXPIRE or 24) * 3600
+                "meta": (self.META_CACHE_EXPIRE or 24) * 3600,
+                "memory": 2 * 1024
             }
         return {
             "torrents": 100,
@@ -560,7 +550,8 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             "douban": 256,
             "bangumi": 256,
             "fanart": 128,
-            "meta": (self.META_CACHE_EXPIRE or 2) * 3600
+            "meta": (self.META_CACHE_EXPIRE or 2) * 3600,
+            "memory": 1024
         }
 
     @property
@@ -636,6 +627,10 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         return UrlUtils.combine_url(host=self.APP_DOMAIN, path=url)
 
 
+# 实例化配置
+settings = Settings()
+
+
 class GlobalVar(object):
     """
     全局标识
@@ -692,9 +687,6 @@ class GlobalVar(object):
         """
         return self.is_system_stopped or workflow_id in self.EMERGENCY_STOP_WORKFLOWS
 
-
-# 实例化配置
-settings = Settings()
 
 # 全局标识
 global_vars = GlobalVar()
