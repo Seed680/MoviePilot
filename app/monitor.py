@@ -59,26 +59,23 @@ class Monitor(metaclass=Singleton):
     目录监控处理链，单例模式
     """
 
-    # 退出事件
-    _event = threading.Event()
 
-    # 监控服务
-    _observers = []
-
-    # 定时服务
-    _scheduler = None
-
-    # 存储快照缓存目录
-    _snapshot_cache_dir = None
-
-    # 存储过照间隔（分钟）
-    _snapshot_interval = 5
-
-    # TTL缓存，10秒钟有效
-    _cache = TTLCache(maxsize=1024, ttl=10)
 
     def __init__(self):
         super().__init__()
+        # 退出事件
+        self._event = threading.Event()
+        # 监控服务
+        self._observers = []
+        # 定时服务
+        self._scheduler = None
+        # 存储快照缓存目录
+        self._snapshot_cache_dir = None
+        # 存储过照间隔（分钟）
+        self._snapshot_interval = 5
+        # TTL缓存，10秒钟有效
+        self._cache = TTLCache(maxsize=1024, ttl=10)
+        # 监控的文件扩展名
         self.all_exts = settings.RMT_MEDIAEXT
         # 初始化快照缓存目录
         self._snapshot_cache_dir = settings.TEMP_PATH / "snapshots"
@@ -394,6 +391,14 @@ class Monitor(metaclass=Singleton):
                                         capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     output = result.stdout.lower()
+                    # 以下本地文件系统含有fuse关键字
+                    local_fs = [
+                        "fuse.shfs",  # Unraid
+                        "zfuse.zfsv",  # 极空间(zfuse.zfsv2、zfuse.zfsv3、...)
+                        # TBD
+                    ]
+                    if any(fs in output for fs in local_fs):
+                        return False
                     network_fs = ['nfs', 'cifs', 'smbfs', 'fuse', 'sshfs', 'ftpfs']
                     return any(fs in output for fs in network_fs)
             elif system == 'Darwin':

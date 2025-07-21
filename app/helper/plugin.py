@@ -18,14 +18,14 @@ from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 from app.utils.system import SystemUtils
 from app.utils.url import UrlUtils
 
 PLUGIN_DIR = Path(settings.ROOT_PATH) / "app" / "plugins"
 
 
-class PluginHelper(metaclass=Singleton):
+class PluginHelper(metaclass=WeakSingleton):
     """
     插件市场管理，下载安装插件到本地
     """
@@ -649,10 +649,20 @@ class PluginHelper(metaclass=Singleton):
         """
         dependencies = {}
         try:
+            install_plugins = {
+                plugin_id.lower()  # 对应插件的小写目录名
+                for plugin_id in SystemConfigOper().get(
+                    SystemConfigKey.UserInstalledPlugins
+                ) or []
+            }
             for plugin_dir in PLUGIN_DIR.iterdir():
                 if plugin_dir.is_dir():
                     requirements_file = plugin_dir / "requirements.txt"
                     if requirements_file.exists():
+                        if plugin_dir.name not in install_plugins:
+                            # 这个插件不在安装列表中 忽略它的依赖
+                            logger.debug(f"忽略插件 {plugin_dir.name} 的依赖")
+                            continue
                         # 解析当前插件的 requirements.txt，获取依赖项
                         plugin_deps = self.__parse_requirements(requirements_file)
                         for pkg_name, version_specifiers in plugin_deps.items():

@@ -12,10 +12,10 @@ import requests
 from app.core.cache import cached
 from app.core.config import settings
 from app.utils.http import RequestUtils
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 
 
-class DoubanApi(metaclass=Singleton):
+class DoubanApi(metaclass=WeakSingleton):
     _urls = {
         # 搜索类
         # sort=U:近期热门 T:标记最多 S:评分最高 R:最新上映
@@ -151,7 +151,6 @@ class DoubanApi(metaclass=Singleton):
     _api_key2 = "0ab215a8b1977939201640fa14c66bab"
     _base_url = "https://frodo.douban.com/api/v2"
     _api_url = "https://api.douban.com/v2"
-    _session = None
 
     def __init__(self):
         self._session = requests.Session()
@@ -235,7 +234,7 @@ class DoubanApi(metaclass=Singleton):
         if '_ts' in params:
             params.pop('_ts')
         resp = RequestUtils(
-            ua=settings.USER_AGENT,
+            ua=settings.NORMAL_USER_AGENT,
             session=self._session,
         ).post_res(url=req_url, data=params)
         if resp is not None and resp.status_code == 400 and "rate_limit" in resp.text:

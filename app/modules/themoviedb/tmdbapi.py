@@ -514,7 +514,7 @@ class TmdbApi:
             return {}
         logger.info("正在从TheDbMovie网站查询：%s ..." % name)
         tmdb_url = "https://www.themoviedb.org/search?query=%s" % quote(name)
-        res = RequestUtils(timeout=5, ua=settings.USER_AGENT, proxies=settings.PROXY).get_res(url=tmdb_url)
+        res = RequestUtils(timeout=5, ua=settings.NORMAL_USER_AGENT, proxies=settings.PROXY).get_res(url=tmdb_url)
         if res is None:
             return None
         if res.status_code == 429:
@@ -563,6 +563,9 @@ class TmdbApi:
         except Exception as err:
             logger.error(f"从TheDbMovie网站查询出错：{str(err)}")
             return {}
+        finally:
+            if html is not None:
+                del html
         return {}
 
     def get_info(self,

@@ -423,6 +423,14 @@ def site_mapping(_: User = Depends(get_current_active_superuser)):
         return schemas.Response(success=False, message=f"获取映射失败：{str(e)}")
 
 
+@router.get("/supporting", summary="获取支持的站点列表", response_model=dict)
+def support_sites(_: User = Depends(get_current_active_superuser)):
+    """
+    获取支持的站点列表
+    """
+    return SitesHelper().get_indexsites()
+
+
 @router.get("/{site_id}", summary="站点详情", response_model=schemas.Site)
 def read_site(
         site_id: int,

@@ -11,6 +11,7 @@ from typing import Optional, Union, Annotated
 import aiofiles
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from PIL import Image
+from app.helper.sites import SitesHelper
 from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -18,10 +19,10 @@ from app import schemas
 from app.chain.search import SearchChain
 from app.chain.system import SystemChain
 from app.core.config import global_vars, settings
+from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
 from app.core.module import ModuleManager
 from app.core.security import verify_apitoken, verify_resource_token, verify_token
-from app.core.event import eventmanager
 from app.db.models import User
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import get_current_active_superuser
@@ -29,7 +30,6 @@ from app.helper.mediaserver import MediaServerHelper
 from app.helper.message import MessageHelper
 from app.helper.progress import ProgressHelper
 from app.helper.rule import RuleHelper
-from app.helper.sites import SitesHelper
 from app.helper.subscribe import SubscribeHelper
 from app.helper.system import SystemHelper
 from app.log import logger
@@ -40,7 +40,6 @@ from app.utils.crypto import HashUtils
 from app.utils.http import RequestUtils
 from app.utils.security import SecurityUtils
 from app.utils.url import UrlUtils
-from app.helper.system import SystemHelper
 from version import APP_VERSION
 
 router = APIRouter()
@@ -96,7 +95,7 @@ def fetch_image(
     # 请求远程图片
     referer = "https://movie.douban.com/" if "doubanio.com" in url else None
     proxies = settings.PROXY if proxy else None
-    response = RequestUtils(ua=settings.USER_AGENT, proxies=proxies, referer=referer,
+    response = RequestUtils(ua=settings.NORMAL_USER_AGENT, proxies=proxies, referer=referer,
                             accept_type="image/avif,image/webp,image/apng,*/*").get_res(url=url)
     if not response:
         raise HTTPException(status_code=502, detail="Failed to fetch the image from the remote server")
@@ -188,9 +187,11 @@ def get_global_setting(token: str):
                  "COOKIECLOUD_KEY", "COOKIECLOUD_PASSWORD", "GITHUB_TOKEN", "REPO_GITHUB_TOKEN"}
     )
     # 追加用户唯一ID和订阅分享管理权限
+    share_admin = SubscribeHelper().is_admin_user()
     info.update({
         "USER_UNIQUE_ID": SubscribeHelper().get_user_uuid(),
-        "SUBSCRIBE_SHARE_MANAGE": SubscribeHelper().is_admin_user(),
+        "SUBSCRIBE_SHARE_MANAGE": share_admin,
+        "WORKFLOW_SHARE_MANAGE": share_admin
     })
     return schemas.Response(success=True,
                             data=info)
@@ -291,9 +292,9 @@ def get_setting(key: str,
 
 @router.post("/setting/{key}", summary="更新系统设置", response_model=schemas.Response)
 def set_setting(
-    key: str,
-    value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
-    _: User = Depends(get_current_active_superuser),
+        key: str,
+        value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
+        _: User = Depends(get_current_active_superuser),
 ):
     """
     更新系统设置（仅管理员）
@@ -453,10 +454,10 @@ def ruletest(title: str,
 
 @router.get("/nettest", summary="测试网络连通性")
 def nettest(
-    url: str,
-    proxy: bool,
-    include: Optional[str] = None,
-    _: schemas.TokenPayload = Depends(verify_token),
+        url: str,
+        proxy: bool,
+        include: Optional[str] = None,
+        _: schemas.TokenPayload = Depends(verify_token),
 ):
     """
     测试网络连通性
@@ -464,43 +465,68 @@ def nettest(
     # 记录开始的毫秒数
     start_time = datetime.now()
     headers = None
-    if "github" in url or "{GITHUB_PROXY}" in url:
+    # 当前使用的加速代理
+    proxy_name = ""
+    if "github" in url:
         # 这是github的连通性测试
+        headers = settings.GITHUB_HEADERS
+    if "{GITHUB_PROXY}" in url:
         url = url.replace(
             "{GITHUB_PROXY}", UrlUtils.standardize_base_url(settings.GITHUB_PROXY or "")
         )
-        headers = settings.GITHUB_HEADERS
+        if settings.GITHUB_PROXY:
+            proxy_name = "Github加速代理"
+    if "{PIP_PROXY}" in url:
+        url = url.replace(
+            "{PIP_PROXY}",
+            UrlUtils.standardize_base_url(
+                settings.PIP_PROXY or "https://pypi.org/simple/"
+            ),
+        )
+        if settings.PIP_PROXY:
+            proxy_name = "PIP加速代理"
     url = url.replace("{TMDBAPIKEY}", settings.TMDB_API_KEY)
-    url = url.replace(
-        "{PIP_PROXY}",
-        UrlUtils.standardize_base_url(settings.PIP_PROXY or "https://pypi.org/simple/"),
-    )
     result = RequestUtils(
         proxies=settings.PROXY if proxy else None,
         headers=headers,
         timeout=10,
-        ua=settings.USER_AGENT,
+        ua=settings.NORMAL_USER_AGENT,
     ).get_res(url)
     # 计时结束的毫秒数
     end_time = datetime.now()
     time = round((end_time - start_time).total_seconds() * 1000)
     # 计算相关秒数
     if result is None:
-        return schemas.Response(success=False, message="无法连接", data={"time": time})
+        return schemas.Response(
+            success=False, message=f"{proxy_name}无法连接", data={"time": time}
+        )
     elif result.status_code == 200:
         if include and not re.search(r"%s" % include, result.text, re.IGNORECASE):
             # 通常是被加速代理跳转到其它页面了
             logger.error(f"{url} 的响应内容不匹配包含规则 {include}")
+            if proxy_name:
+                message = f"{proxy_name}已失效，请检查配置"
+            else:
+                message = f"无效响应，不匹配 {include}"
             return schemas.Response(
                 success=False,
-                message=f"无效响应，不匹配 {include}",
+                message=message,
                 data={"time": time},
             )
         return schemas.Response(success=True, data={"time": time})
     else:
-        return schemas.Response(
-            success=False, message=f"错误码：{result.status_code}", data={"time": time}
-        )
+        if proxy_name:
+            # 加速代理失败
+            message = f"{proxy_name}已失效，错误码：{result.status_code}"
+        else:
+            message = f"错误码：{result.status_code}"
+            if "github" in url:
+                # 非加速代理访问github
+                if result.status_code == 401:
+                    message = "Github Token已失效，请检查配置"
+                elif result.status_code in {403, 429}:
+                    message = "触发限流，请配置Github Token"
+        return schemas.Response(success=False, message=message, data={"time": time})
 
 
 @router.get("/modulelist", summary="查询已加载的模块ID列表", response_model=schemas.Response)

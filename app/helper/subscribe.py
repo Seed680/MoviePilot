@@ -8,11 +8,11 @@ from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 from app.utils.system import SystemUtils
 
 
-class SubscribeHelper(metaclass=Singleton):
+class SubscribeHelper(metaclass=WeakSingleton):
     """
     订阅数据统计/订阅分享等
     """
@@ -28,6 +28,8 @@ class SubscribeHelper(metaclass=Singleton):
     _sub_share = f"{settings.MP_SERVER_HOST}/subscribe/share"
 
     _sub_shares = f"{settings.MP_SERVER_HOST}/subscribe/shares"
+
+    _sub_share_statistic = f"{settings.MP_SERVER_HOST}/subscribe/share/statistics"
 
     _sub_fork = f"{settings.MP_SERVER_HOST}/subscribe/fork/%s"
 
@@ -199,7 +201,7 @@ class SubscribeHelper(metaclass=Singleton):
         else:
             return False, res.json().get("message")
 
-    @cached(region=_shares_cache_region)
+    @cached(region=_shares_cache_region, maxsize=1, ttl=1800, skip_empty=True)
     def get_shares(self, name: Optional[str] = None, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         获取订阅分享数据
@@ -211,6 +213,18 @@ class SubscribeHelper(metaclass=Singleton):
             "page": page,
             "count": count
         })
+        if res and res.status_code == 200:
+            return res.json()
+        return []
+
+    @cached(region=_shares_cache_region, maxsize=1, ttl=1800, skip_empty=True)
+    def get_share_statistics(self) -> List[dict]:
+        """
+        获取订阅分享统计数据
+        """
+        if not settings.SUBSCRIBE_STATISTIC_SHARE:
+            return []
+        res = RequestUtils(proxies=settings.PROXY, timeout=15).get_res(self._sub_share_statistic)
         if res and res.status_code == 200:
             return res.json()
         return []

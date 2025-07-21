@@ -5,9 +5,9 @@ import signal
 import sys
 import threading
 
+import uvicorn as uvicorn
 from PIL import Image
 from uvicorn import Config
-from uvicorn.server import Server
 
 from app.factory import app
 from app.utils.system import SystemUtils
@@ -24,23 +24,10 @@ from app.db.init import init_db, update_db
 setproctitle.setproctitle(settings.PROJECT_NAME)
 
 # uvicorn服务
-# Server = uvicorn.Server(Config(app, host=settings.HOST, port=settings.PORT,
-#                                reload=settings.DEV, workers=multiprocessing.cpu_count(),
-#                                timeout_graceful_shutdown=30))
+Server = uvicorn.Server(Config(app, host=settings.HOST, port=settings.PORT,
+                               reload=settings.DEV, workers=multiprocessing.cpu_count(),
+                               timeout_graceful_shutdown=60))
 
-def run():
-    config = Config(
-        app=app,
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.DEV,
-        workers=multiprocessing.cpu_count(),
-        timeout_graceful_shutdown=5
-    )
-    server = Server(config)
-    # 建议在协程中运行 serve 方法
-    import asyncio
-    asyncio.run(server.serve())
 
 def start_tray():
     """
@@ -108,5 +95,4 @@ if __name__ == '__main__':
     # 更新数据库
     update_db()
     # 启动API服务
-    # Server.run()
-    run()
+    Server.run()

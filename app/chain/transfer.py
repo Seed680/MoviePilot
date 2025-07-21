@@ -5,7 +5,6 @@ import threading
 import traceback
 from copy import deepcopy
 from pathlib import Path
-from queue import Queue
 from time import sleep
 from typing import List, Optional, Tuple, Union, Dict, Callable
 
@@ -16,9 +15,9 @@ from app.chain.storage import StorageChain
 from app.chain.tmdb import TmdbChain
 from app.core.config import settings, global_vars
 from app.core.context import MediaInfo
+from app.core.event import eventmanager
 from app.core.meta import MetaBase
 from app.core.metainfo import MetaInfoPath
-from app.core.event import eventmanager
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.models.downloadhistory import DownloadHistory
 from app.db.models.transferhistory import TransferHistory
@@ -28,11 +27,11 @@ from app.helper.directory import DirectoryHelper
 from app.helper.format import FormatParser
 from app.helper.progress import ProgressHelper
 from app.log import logger
+from app.schemas import StorageOperSelectionEventData
 from app.schemas import TransferInfo, TransferTorrent, Notification, EpisodeFormat, FileItem, TransferDirectoryConf, \
     TransferTask, TransferQueue, TransferJob, TransferJobTask
 from app.schemas.types import TorrentStatus, EventType, MediaType, ProgressKey, NotificationType, MessageChannel, \
     SystemConfigKey, ChainEventType, ContentType
-from app.schemas import StorageOperSelectionEventData
 from app.utils.singleton import Singleton
 from app.utils.string import StringUtils
 
@@ -213,6 +212,7 @@ class JobManager:
                                 set(self._season_episodes[mediaid]) - set(task.meta.episode_list)
                             )
                         return task
+            return None
 
     def remove_job(self, task: TransferTask) -> Optional[TransferJob]:
         """
@@ -226,6 +226,7 @@ class JobManager:
                 if __mediaid__ in self._season_episodes:
                     self._season_episodes.pop(__mediaid__)
                 return self._job_view.pop(__mediaid__)
+            return None
 
     def is_done(self, task: TransferTask) -> bool:
         """
@@ -311,7 +312,7 @@ class JobManager:
 
     def count(self, media: MediaInfo, season: Optional[int] = None) -> int:
         """
-        获取某项任务总数
+        获取某项任务成功总数
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
         with job_lock:
@@ -322,7 +323,7 @@ class JobManager:
 
     def size(self, media: MediaInfo, season: Optional[int] = None) -> int:
         """
-        获取某项任务总大小
+        获取某项任务成功文件总大小
         """
         __mediaid__ = self.__get_media_id(media=media, season=season)
         with job_lock:
@@ -359,22 +360,20 @@ class TransferChain(ChainBase, metaclass=Singleton):
     文件整理处理链
     """
 
-    # 可处理的文件后缀
-    all_exts = settings.RMT_MEDIAEXT
-
-    # 待整理任务队列
-    _queue = Queue()
-
-    # 文件整理线程
-    _transfer_thread = None
-
-    # 队列间隔时间（秒）
-    _transfer_interval = 15
-
     def __init__(self):
         super().__init__()
+        # 可处理的文件后缀
+        self.all_exts = settings.RMT_MEDIAEXT
+        # 待整理任务队列
+        self._queue = queue.Queue()
+        # 文件整理线程
+        self._transfer_thread = None
+        # 队列间隔时间（秒）
+        self._transfer_interval = 15
+        # 事件管理器
         self.jobview = JobManager()
-
+        # 车移成功的文件清单
+        self._success_target_files: Dict[str, List[str]] = {}
         # 启动整理任务
         self.__init()
 
@@ -391,6 +390,44 @@ class TransferChain(ChainBase, metaclass=Singleton):
         """
         整理完成后处理
         """
+
+        def __do_finished():
+            """
+            完成时发送消息、刮削事件、移除任务等
+            """
+            # 更新文件数量
+            transferinfo.file_count = self.jobview.count(task.mediainfo, task.meta.begin_season) or 1
+            # 更新文件大小
+            transferinfo.total_size = self.jobview.size(task.mediainfo,
+                                                        task.meta.begin_season) or task.fileitem.size
+            # 更新文件清单
+            transferinfo.file_list_new = self._success_target_files.pop(transferinfo.target_diritem.path, [])
+            # 发送通知，实时手动整理时不发
+            if transferinfo.need_notify and (task.background or not task.manual):
+                se_str = None
+                if task.mediainfo.type == MediaType.TV:
+                    season_episodes = self.jobview.season_episodes(task.mediainfo, task.meta.begin_season)
+                    if season_episodes:
+                        se_str = f"{task.meta.season} {StringUtils.format_ep(season_episodes)}"
+                    else:
+                        se_str = f"{task.meta.season}"
+                self.send_transfer_message(meta=task.meta,
+                                           mediainfo=task.mediainfo,
+                                           transferinfo=transferinfo,
+                                           season_episode=se_str,
+                                           username=task.username)
+            # 刮削事件
+            if transferinfo.need_scrape:
+                self.eventmanager.send_event(EventType.MetadataScrape, {
+                    'meta': task.meta,
+                    'mediainfo': task.mediainfo,
+                    'fileitem': transferinfo.target_diritem,
+                    'file_list': transferinfo.file_list_new,
+                    'overwrite': False
+                })
+            # 移除已完成的任务
+            self.jobview.remove_job(task)
+
         transferhis = TransferHistoryOper()
         if not transferinfo.success:
             # 转移失败
@@ -416,6 +453,10 @@ class TransferChain(ChainBase, metaclass=Singleton):
             ))
             # 整理失败
             self.jobview.fail_task(task)
+            with task_lock:
+                # 整理完成且有成功的任务时
+                if self.jobview.is_finished(task):
+                    __do_finished()
             return False, transferinfo.message
 
         # 转移成功
@@ -444,55 +485,57 @@ class TransferChain(ChainBase, metaclass=Singleton):
         })
 
         with task_lock:
+            # 登记转移成功文件清单
+            target_dir_path = transferinfo.target_diritem.path
+            target_files = transferinfo.file_list_new
+            if self._success_target_files.get(target_dir_path):
+                self._success_target_files[target_dir_path].extend(target_files)
+            else:
+                self._success_target_files[target_dir_path] = target_files
             # 全部整理成功时
             if self.jobview.is_success(task):
                 # 移动模式删除空目录
                 if transferinfo.transfer_type in ["move"]:
                     # 所有成功的业务
                     tasks = self.jobview.success_tasks(task.mediainfo, task.meta.begin_season)
-                    # 记录已处理的种子hash
-                    processed_hashes = set()
                     storagechain = StorageChain()
+                    downloadhistoryoper = DownloadHistoryOper()
                     for t in tasks:
                         # 下载器hash
-                        if t.download_hash and t.download_hash not in processed_hashes:
-                            processed_hashes.add(t.download_hash)
-                            if self.remove_torrents(t.download_hash, downloader=t.downloader):
-                                logger.info(f"移动模式删除种子成功：{t.download_hash} ")
-                        # 删除残留目录
-                        if t.fileitem:
-                            storagechain.delete_media_file(t.fileitem, delete_self=False)
+                        if not t.download_hash:
+                            continue
+                        # 获取种子保存目录
+                        seed_dir_path = self.__get_torrent_save_path(download_hash=t.download_hash,
+                                                                     downloader=t.downloader)
+                        if not seed_dir_path:
+                            # 如果无法从下载器获取，则尝试从历史记录获取
+                            download_history = downloadhistoryoper.get_by_hash(t.download_hash)
+                            if download_history and download_history.path:
+                                seed_dir_path = download_history.path
+                            else:
+                                logger.warn(f"无法获取种子 {t.download_hash} 的保存路径")
+                                continue
+
+                        # 检查种子目录下是否还有有效媒体文件
+                        seed_dir_item = storagechain.get_file_item(storage=t.fileitem.storage,
+                                                                   path=Path(seed_dir_path))
+                        if seed_dir_item and seed_dir_item.type == "dir":
+                            remain_files = storagechain.list_files(seed_dir_item, recursion=True)
+                            has_media = any(
+                                f.extension and f.extension.lower() in [ext.lstrip('.') for ext in self.all_exts]
+                                for f in remain_files if f.type == "file"
+                            )
+                            if not has_media:
+                                if self.remove_torrents(t.download_hash, downloader=t.downloader):
+                                    logger.info(f"移动模式删除种子成功：{t.download_hash} ")
+                                # 删除残留目录
+                                storagechain.delete_media_file(seed_dir_item, delete_self=False)
+                            else:
+                                logger.info(
+                                    f"种子目录 {seed_dir_path} 还有未整理的媒体文件，暂不删除种子和残留目录")
             # 整理完成且有成功的任务时
             if self.jobview.is_finished(task):
-                # 发送通知，实时手动整理时不发
-                if transferinfo.need_notify and (task.background or not task.manual):
-                    se_str = None
-                    if task.mediainfo.type == MediaType.TV:
-                        season_episodes = self.jobview.season_episodes(task.mediainfo, task.meta.begin_season)
-                        if season_episodes:
-                            se_str = f"{task.meta.season} {StringUtils.format_ep(season_episodes)}"
-                        else:
-                            se_str = f"{task.meta.season}"
-                    # 更新文件数量
-                    transferinfo.file_count = self.jobview.count(task.mediainfo, task.meta.begin_season) or 1
-                    # 更新文件大小
-                    transferinfo.total_size = self.jobview.size(task.mediainfo,
-                                                                task.meta.begin_season) or task.fileitem.size
-                    self.send_transfer_message(meta=task.meta,
-                                               mediainfo=task.mediainfo,
-                                               transferinfo=transferinfo,
-                                               season_episode=se_str,
-                                               username=task.username)
-                # 刮削事件
-                if transferinfo.need_scrape:
-                    self.eventmanager.send_event(EventType.MetadataScrape, {
-                        'meta': task.meta,
-                        'mediainfo': task.mediainfo,
-                        'fileitem': transferinfo.target_diritem
-                    })
-
-                # 移除已完成的任务
-                self.jobview.remove_job(task)
+                __do_finished()
 
         return True, ""
 
@@ -1099,7 +1142,8 @@ class TransferChain(ChainBase, metaclass=Singleton):
                 # 自定义识别
                 if formaterHandler:
                     # 开始集、结束集、PART
-                    begin_ep, end_ep, part = formaterHandler.split_episode(file_name=file_path.name, file_meta=file_meta)
+                    begin_ep, end_ep, part = formaterHandler.split_episode(file_name=file_path.name,
+                                                                           file_meta=file_meta)
                     if begin_ep is not None:
                         file_meta.begin_episode = begin_ep
                         file_meta.part = part
@@ -1412,3 +1456,20 @@ class TransferChain(ChainBase, metaclass=Singleton):
             season_episode=season_episode,
             username=username
         )
+
+    def __get_torrent_save_path(self, download_hash: str, downloader: str) -> Optional[str]:
+        """
+        从下载器获取种子的保存路径
+        :param download_hash: 种子Hash
+        :param downloader: 下载器名称
+        :return: 种子保存路径，如果获取失败返回None
+        """
+        try:
+            # 通过下载器获取种子信息
+            torrents = self.list_torrents(hashs=download_hash, downloader=downloader)
+            if not torrents:
+                return None
+            return torrents[0].path
+        except Exception as e:
+            logger.error(f"获取种子 {download_hash} 保存路径失败：{e}")
+            return None
