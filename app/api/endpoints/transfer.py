@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.metainfo import MetaInfoPath
 from app.core.security import verify_token, verify_apitoken
 from app.db import get_db
+from app.db.models import User
 from app.db.models.transferhistory import TransferHistory
 from app.db.user_oper import get_current_active_superuser
 from app.helper.directory import DirectoryHelper
@@ -58,7 +59,7 @@ def query_name(path: str, filetype: str,
 
 
 @router.get("/queue", summary="查询整理队列", response_model=List[schemas.TransferJob])
-def query_queue(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
+async def query_queue(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询整理队列
     :param _: Token校验
@@ -67,7 +68,7 @@ def query_queue(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
 
 
 @router.delete("/queue", summary="从整理队列中删除任务", response_model=schemas.Response)
-def remove_queue(fileitem: schemas.FileItem, _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+async def remove_queue(fileitem: schemas.FileItem, _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询整理队列
     :param fileitem: 文件项
@@ -81,7 +82,7 @@ def remove_queue(fileitem: schemas.FileItem, _: schemas.TokenPayload = Depends(v
 def manual_transfer(transer_item: ManualTransferItem,
                     background: Optional[bool] = False,
                     db: Session = Depends(get_db),
-                    _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
+                    _: User = Depends(get_current_active_superuser)) -> Any:
     """
     手动转移，文件或历史记录，支持自定义剧集识别格式
     :param transer_item: 手工整理项

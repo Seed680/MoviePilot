@@ -1,4 +1,3 @@
-import gc
 import queue
 import re
 import threading
@@ -499,40 +498,14 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     # 所有成功的业务
                     tasks = self.jobview.success_tasks(task.mediainfo, task.meta.begin_season)
                     storagechain = StorageChain()
-                    downloadhistoryoper = DownloadHistoryOper()
+                    # 获取整理屏蔽词
+                    transfer_exclude_words = SystemConfigOper().get(SystemConfigKey.TransferExcludeWords)
                     for t in tasks:
-                        # 下载器hash
-                        if not t.download_hash:
-                            continue
-                        # 获取种子保存目录
-                        seed_dir_path = self.__get_torrent_save_path(download_hash=t.download_hash,
-                                                                     downloader=t.downloader)
-                        if not seed_dir_path:
-                            # 如果无法从下载器获取，则尝试从历史记录获取
-                            download_history = downloadhistoryoper.get_by_hash(t.download_hash)
-                            if download_history and download_history.path:
-                                seed_dir_path = download_history.path
-                            else:
-                                logger.warn(f"无法获取种子 {t.download_hash} 的保存路径")
-                                continue
-
-                        # 检查种子目录下是否还有有效媒体文件
-                        seed_dir_item = storagechain.get_file_item(storage=t.fileitem.storage,
-                                                                   path=Path(seed_dir_path))
-                        if seed_dir_item and seed_dir_item.type == "dir":
-                            remain_files = storagechain.list_files(seed_dir_item, recursion=True)
-                            has_media = any(
-                                f.extension and f.extension.lower() in [ext.lstrip('.') for ext in self.all_exts]
-                                for f in remain_files if f.type == "file"
-                            )
-                            if not has_media:
-                                if self.remove_torrents(t.download_hash, downloader=t.downloader):
-                                    logger.info(f"移动模式删除种子成功：{t.download_hash} ")
-                                # 删除残留目录
-                                storagechain.delete_media_file(seed_dir_item, delete_self=False)
-                            else:
-                                logger.info(
-                                    f"种子目录 {seed_dir_path} 还有未整理的媒体文件，暂不删除种子和残留目录")
+                        if t.download_hash and self._can_delete_torrent(t.download_hash, t.downloader, transfer_exclude_words):
+                            if self.remove_torrents(t.download_hash, downloader=t.downloader):
+                                logger.info(f"移动模式删除种子成功：{t.download_hash}")
+                        if t.fileitem:
+                            storagechain.delete_media_file(t.fileitem, delete_self=False)
             # 整理完成且有成功的任务时
             if self.jobview.is_finished(task):
                 __do_finished()
@@ -890,7 +863,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     state, errmsg = self.do_transfer(
                         fileitem=FileItem(
                             storage="local",
-                            path=str(file_path).replace("\\", "/"),
+                            path=file_path.as_posix(),
                             type="dir" if not file_path.is_file() else "file",
                             name=file_path.name,
                             size=file_path.stat().st_size,
@@ -909,10 +882,6 @@ class TransferChain(ChainBase, metaclass=Singleton):
             finally:
                 torrents.clear()
                 del torrents
-
-            # 如果不是大内存模式，进行垃圾回收
-            if not settings.BIG_MEMORY_MODE:
-                gc.collect()
 
             # 结束
             logger.info("所有下载器中下载完成的文件已整理完成")
@@ -1101,16 +1070,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     continue
 
                 # 整理屏蔽词不处理
-                is_blocked = False
-                if transfer_exclude_words:
-                    for keyword in transfer_exclude_words:
-                        if not keyword:
-                            continue
-                        if keyword and re.search(r"%s" % keyword, file_item.path, re.IGNORECASE):
-                            logger.info(f"{file_item.path} 命中整理屏蔽词 {keyword}，不处理")
-                            is_blocked = True
-                            break
-                if is_blocked:
+                if self._is_blocked_by_exclude_words(file_item.path, transfer_exclude_words):
                     continue
 
                 # 整理成功的不再处理
@@ -1386,7 +1346,8 @@ class TransferChain(ChainBase, metaclass=Singleton):
             mediainfo: MediaInfo = MediaChain().recognize_media(tmdbid=tmdbid, doubanid=doubanid,
                                                                 mtype=mtype, episode_group=episode_group)
             if not mediainfo:
-                return False, f"媒体信息识别失败，tmdbid：{tmdbid}，doubanid：{doubanid}，type: {mtype.value}"
+                return (False,
+                        f"媒体信息识别失败，tmdbid：{tmdbid}，doubanid：{doubanid}，type: {mtype.value if mtype else None}")
             else:
                 # 更新媒体图片
                 self.obtain_images(mediainfo=mediainfo)
@@ -1457,19 +1418,67 @@ class TransferChain(ChainBase, metaclass=Singleton):
             username=username
         )
 
-    def __get_torrent_save_path(self, download_hash: str, downloader: str) -> Optional[str]:
+    @staticmethod
+    def _is_blocked_by_exclude_words(file_path: str, exclude_words: list) -> bool:
         """
-        从下载器获取种子的保存路径
+        检查文件是否被整理屏蔽词阻止处理
+        :param file_path: 文件路径
+        :param exclude_words: 整理屏蔽词列表
+        :return: 如果被屏蔽返回True，否则返回False
+        """
+        if not exclude_words:
+            return False
+
+        for keyword in exclude_words:
+            if keyword and re.search(r"%s" % keyword, file_path, re.IGNORECASE):
+                logger.debug(f"{file_path} 命中屏蔽词 {keyword}")
+                return True
+        return False
+
+
+    def _can_delete_torrent(self, download_hash: str, downloader: str, transfer_exclude_words) -> bool:
+        """
+        检查是否可以删除种子文件
         :param download_hash: 种子Hash
         :param downloader: 下载器名称
-        :return: 种子保存路径，如果获取失败返回None
+        :param transfer_exclude_words: 整理屏蔽词
+        :return: 如果可以删除返回True，否则返回False
         """
         try:
-            # 通过下载器获取种子信息
+            # 获取种子信息
             torrents = self.list_torrents(hashs=download_hash, downloader=downloader)
             if not torrents:
-                return None
-            return torrents[0].path
+                return False
+
+            # 未下载完成
+            if torrents[0].progress < 100:
+                return False
+
+            # 获取种子文件列表
+            torrent_files = self.torrent_files(download_hash, downloader)
+            if not torrent_files:
+                return False
+
+            if not isinstance(torrent_files, list):
+                torrent_files = torrent_files.data
+
+            # 检查是否有媒体文件未被屏蔽且存在
+            save_path = torrents[0].path.parent
+            for file in torrent_files:
+                file_path = save_path / file.name
+                # 如果存在未被屏蔽的媒体文件，则不删除种子
+                if (
+                    file_path.suffix in self.all_exts
+                    and not self._is_blocked_by_exclude_words(
+                        str(file_path), transfer_exclude_words
+                    )
+                    and file_path.exists()
+                ):
+                    return False
+
+            # 所有媒体文件都被屏蔽或不存在，可以删除种子
+            return True
+
         except Exception as e:
-            logger.error(f"获取种子 {download_hash} 保存路径失败：{e}")
-            return None
+            logger.error(f"检查种子 {download_hash} 是否需要删除失败：{e}")
+            return False

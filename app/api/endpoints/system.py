@@ -2,16 +2,15 @@ import asyncio
 import io
 import json
 import re
-import tempfile
 from collections import deque
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, Union, Annotated
 
 import aiofiles
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from PIL import Image
-from app.helper.sites import SitesHelper
+from aiopath import AsyncPath
+from app.helper.sites import SitesHelper  # noqa  # noqa
 from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -25,7 +24,7 @@ from app.core.module import ModuleManager
 from app.core.security import verify_apitoken, verify_resource_token, verify_token
 from app.db.models import User
 from app.db.systemconfig_oper import SystemConfigOper
-from app.db.user_oper import get_current_active_superuser
+from app.db.user_oper import get_current_active_superuser, get_current_active_superuser_async
 from app.helper.mediaserver import MediaServerHelper
 from app.helper.message import MessageHelper
 from app.helper.progress import ProgressHelper
@@ -37,7 +36,7 @@ from app.scheduler import Scheduler
 from app.schemas import ConfigChangeEventData
 from app.schemas.types import SystemConfigKey, EventType
 from app.utils.crypto import HashUtils
-from app.utils.http import RequestUtils
+from app.utils.http import RequestUtils, AsyncRequestUtils
 from app.utils.security import SecurityUtils
 from app.utils.url import UrlUtils
 from version import APP_VERSION
@@ -45,7 +44,7 @@ from version import APP_VERSION
 router = APIRouter()
 
 
-def fetch_image(
+async def fetch_image(
         url: str,
         proxy: bool = False,
         use_disk_cache: bool = False,
@@ -65,24 +64,28 @@ def fetch_image(
         raise HTTPException(status_code=404, detail="Unsafe URL")
 
     # 后续观察系统性能表现，如果发现磁盘缓存和HTTP缓存无法满足高并发情况下的响应速度需求，可以考虑重新引入内存缓存
-    cache_path = None
+    cache_path: Optional[AsyncPath] = None
     if use_disk_cache:
         # 生成缓存路径
+        base_path = AsyncPath(settings.CACHE_PATH)
         sanitized_path = SecurityUtils.sanitize_url_path(url)
-        cache_path = settings.CACHE_PATH / "images" / sanitized_path
+        cache_path = base_path / "images" / sanitized_path
 
         # 没有文件类型，则添加后缀，在恶意文件类型和实际需求下的折衷选择
         if not cache_path.suffix:
             cache_path = cache_path.with_suffix(".jpg")
 
         # 确保缓存路径和文件类型合法
-        if not SecurityUtils.is_safe_path(settings.CACHE_PATH, cache_path, settings.SECURITY_IMAGE_SUFFIXES):
+        if not await SecurityUtils.async_is_safe_path(base_path=base_path,
+                                                      user_path=cache_path,
+                                                      allowed_suffixes=settings.SECURITY_IMAGE_SUFFIXES):
             raise HTTPException(status_code=400, detail="Invalid cache path or file type")
 
         # 目前暂不考虑磁盘缓存文件是否过期，后续通过缓存清理机制处理
-        if cache_path.exists():
+        if cache_path and await cache_path.exists():
             try:
-                content = cache_path.read_bytes()
+                async with cache_path.open('rb') as f:
+                    content = await f.read()
                 etag = HashUtils.md5(content)
                 headers = RequestUtils.generate_cache_headers(etag, max_age=86400 * 7)
                 if if_none_match == etag:
@@ -95,19 +98,19 @@ def fetch_image(
     # 请求远程图片
     referer = "https://movie.douban.com/" if "doubanio.com" in url else None
     proxies = settings.PROXY if proxy else None
-    response = RequestUtils(ua=settings.NORMAL_USER_AGENT, proxies=proxies, referer=referer,
-                            accept_type="image/avif,image/webp,image/apng,*/*").get_res(url=url)
+    response = await AsyncRequestUtils(ua=settings.NORMAL_USER_AGENT, proxies=proxies, referer=referer,
+                                       accept_type="image/avif,image/webp,image/apng,*/*").get_res(url=url)
     if not response:
         raise HTTPException(status_code=502, detail="Failed to fetch the image from the remote server")
 
     # 验证下载的内容是否为有效图片
     try:
-        Image.open(io.BytesIO(response.content)).verify()
+        content = response.content
+        Image.open(io.BytesIO(content)).verify()
     except Exception as e:
         logger.debug(f"Invalid image format for URL {url}: {e}")
         raise HTTPException(status_code=502, detail="Invalid image format")
 
-    content = response.content
     response_headers = response.headers
 
     cache_control_header = response_headers.get("Cache-Control", "")
@@ -116,12 +119,12 @@ def fetch_image(
     # 如果需要使用磁盘缓存，则保存到磁盘
     if use_disk_cache and cache_path:
         try:
-            if not cache_path.parent.exists():
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=cache_path.parent, delete=False) as tmp_file:
-                tmp_file.write(content)
-                temp_path = Path(tmp_file.name)
-            temp_path.replace(cache_path)
+            if not await cache_path.parent.exists():
+                await cache_path.parent.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.tempfile.NamedTemporaryFile(dir=cache_path.parent, delete=False) as tmp_file:
+                await tmp_file.write(content)
+                temp_path = AsyncPath(tmp_file.name)
+            await temp_path.replace(cache_path)
         except Exception as e:
             logger.debug(f"Failed to write cache file {cache_path}: {e}")
 
@@ -141,7 +144,7 @@ def fetch_image(
 
 
 @router.get("/img/{proxy}", summary="图片代理")
-def proxy_img(
+async def proxy_img(
         imgurl: str,
         proxy: bool = False,
         cache: bool = False,
@@ -155,12 +158,12 @@ def proxy_img(
     hosts = [config.config.get("host") for config in MediaServerHelper().get_configs().values() if
              config and config.config and config.config.get("host")]
     allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS) | set(hosts)
-    return fetch_image(url=imgurl, proxy=proxy, use_disk_cache=cache,
-                       if_none_match=if_none_match, allowed_domains=allowed_domains)
+    return await fetch_image(url=imgurl, proxy=proxy, use_disk_cache=cache,
+                             if_none_match=if_none_match, allowed_domains=allowed_domains)
 
 
 @router.get("/cache/image", summary="图片缓存")
-def cache_img(
+async def cache_img(
         url: str,
         if_none_match: Annotated[str | None, Header()] = None,
         _: schemas.TokenPayload = Depends(verify_resource_token)
@@ -170,7 +173,8 @@ def cache_img(
     """
     # 如果没有启用全局图片缓存，则不使用磁盘缓存
     proxy = "doubanio.com" not in url
-    return fetch_image(url=url, proxy=proxy, use_disk_cache=settings.GLOBAL_IMAGE_CACHE, if_none_match=if_none_match)
+    return await fetch_image(url=url, proxy=proxy, use_disk_cache=settings.GLOBAL_IMAGE_CACHE,
+                             if_none_match=if_none_match)
 
 
 @router.get("/global", summary="查询非敏感系统设置", response_model=schemas.Response)
@@ -184,7 +188,8 @@ def get_global_setting(token: str):
     # FIXME: 新增敏感配置项时要在此处添加排除项
     info = settings.dict(
         exclude={"SECRET_KEY", "RESOURCE_SECRET_KEY", "API_TOKEN", "TMDB_API_KEY", "TVDB_API_KEY", "FANART_API_KEY",
-                 "COOKIECLOUD_KEY", "COOKIECLOUD_PASSWORD", "GITHUB_TOKEN", "REPO_GITHUB_TOKEN"}
+                 "COOKIECLOUD_KEY", "COOKIECLOUD_PASSWORD", "GITHUB_TOKEN", "REPO_GITHUB_TOKEN", "U115_APP_ID",
+                 "ALIPAN_APP_ID", "TVDB_V4_API_KEY", "TVDB_V4_API_PIN"}
     )
     # 追加用户唯一ID和订阅分享管理权限
     share_admin = SubscribeHelper().is_admin_user()
@@ -198,7 +203,7 @@ def get_global_setting(token: str):
 
 
 @router.get("/env", summary="查询系统配置", response_model=schemas.Response)
-def get_env_setting(_: User = Depends(get_current_active_superuser)):
+async def get_env_setting(_: User = Depends(get_current_active_superuser_async)):
     """
     查询系统环境变量，包括当前版本号（仅管理员）
     """
@@ -216,8 +221,8 @@ def get_env_setting(_: User = Depends(get_current_active_superuser)):
 
 
 @router.post("/env", summary="更新系统配置", response_model=schemas.Response)
-def set_env_setting(env: dict,
-                    _: User = Depends(get_current_active_superuser)):
+async def set_env_setting(env: dict,
+                          _: User = Depends(get_current_active_superuser_async)):
     """
     更新系统环境变量（仅管理员）
     """
@@ -239,7 +244,7 @@ def set_env_setting(env: dict,
     if success_updates:
         for key in success_updates.keys():
             # 发送配置变更事件
-            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+            await eventmanager.async_send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
                 key=key,
                 value=getattr(settings, key, None),
                 change_type="update"
@@ -268,7 +273,7 @@ async def get_progress(request: Request, process_type: str, _: schemas.TokenPayl
                     break
                 detail = progress.get(process_type)
                 yield f"data: {json.dumps(detail)}\n\n"
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             return
 
@@ -276,8 +281,8 @@ async def get_progress(request: Request, process_type: str, _: schemas.TokenPayl
 
 
 @router.get("/setting/{key}", summary="查询系统设置", response_model=schemas.Response)
-def get_setting(key: str,
-                _: User = Depends(get_current_active_superuser)):
+async def get_setting(key: str,
+                      _: User = Depends(get_current_active_superuser_async)):
     """
     查询系统设置（仅管理员）
     """
@@ -291,10 +296,10 @@ def get_setting(key: str,
 
 
 @router.post("/setting/{key}", summary="更新系统设置", response_model=schemas.Response)
-def set_setting(
+async def set_setting(
         key: str,
         value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
-        _: User = Depends(get_current_active_superuser),
+        _: User = Depends(get_current_active_superuser_async),
 ):
     """
     更新系统设置（仅管理员）
@@ -303,7 +308,7 @@ def set_setting(
         success, message = settings.update_setting(key=key, value=value)
         if success:
             # 发送配置变更事件
-            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+            await eventmanager.async_send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
                 key=key,
                 value=value,
                 change_type="update"
@@ -315,10 +320,10 @@ def set_setting(
         if isinstance(value, list):
             value = list(filter(None, value))
             value = value if value else None
-        success = SystemConfigOper().set(key, value)
+        success = await SystemConfigOper().async_set(key, value)
         if success:
             # 发送配置变更事件
-            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+            await eventmanager.async_send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
                 key=key,
                 value=value,
                 change_type="update"
@@ -358,60 +363,106 @@ async def get_logging(request: Request, length: Optional[int] = 50, logfile: Opt
     length = -1 时, 返回text/plain
     否则 返回格式SSE
     """
-    log_path = settings.LOG_PATH / logfile
+    base_path = AsyncPath(settings.LOG_PATH)
+    log_path = base_path / logfile
 
-    if not SecurityUtils.is_safe_path(settings.LOG_PATH, log_path, allowed_suffixes={".log"}):
+    if not await SecurityUtils.async_is_safe_path(base_path=base_path, user_path=log_path, allowed_suffixes={".log"}):
         raise HTTPException(status_code=404, detail="Not Found")
 
-    if not log_path.exists() or not log_path.is_file():
+    if not await log_path.exists() or not await log_path.is_file():
         raise HTTPException(status_code=404, detail="Not Found")
 
     async def log_generator():
         try:
             # 使用固定大小的双向队列来限制内存使用
             lines_queue = deque(maxlen=max(length, 50))
-            # 使用 aiofiles 异步读取文件
-            async with aiofiles.open(log_path, mode="r", encoding="utf-8") as f:
-                # 逐行读取文件，将每一行存入队列
-                file_content = await f.read()
-                for line in file_content.splitlines():
+            # 获取文件大小
+            file_stat = await log_path.stat()
+            file_size = file_stat.st_size
+
+            # 读取历史日志
+            async with log_path.open(mode="r", encoding="utf-8", errors="ignore") as f:
+                # 优化大文件读取策略
+                if file_size > 100 * 1024:
+                    # 只读取最后100KB的内容
+                    bytes_to_read = min(file_size, 100 * 1024)
+                    position = file_size - bytes_to_read
+                    await f.seek(position)
+                    content = await f.read()
+                    # 找到第一个完整的行
+                    first_newline = content.find('\n')
+                    if first_newline != -1:
+                        content = content[first_newline + 1:]
+                else:
+                    # 小文件直接读取全部内容
+                    content = await f.read()
+
+                # 按行分割并添加到队列，只保留非空行
+                lines = [line.strip() for line in content.splitlines() if line.strip()]
+                # 只取最后N行
+                for line in lines[-max(length, 50):]:
                     lines_queue.append(line)
-                for line in lines_queue:
-                    yield f"data: {line}\n\n"
+
+            # 输出历史日志
+            for line in lines_queue:
+                yield f"data: {line}\n\n"
+
+            # 实时监听新日志
+            async with log_path.open(mode="r", encoding="utf-8", errors="ignore") as f:
                 # 移动文件指针到文件末尾，继续监听新增内容
                 await f.seek(0, 2)
+                # 记录初始文件大小
+                initial_stat = await log_path.stat()
+                initial_size = initial_stat.st_size
+                # 实时监听新日志，使用更短的轮询间隔
                 while not global_vars.is_system_stopped:
                     if await request.is_disconnected():
                         break
-                    line = await f.readline()
-                    if not line:
+                    # 检查文件是否有新内容
+                    current_stat = await log_path.stat()
+                    current_size = current_stat.st_size
+                    if current_size > initial_size:
+                        # 文件有新内容，读取新行
+                        line = await f.readline()
+                        if line:
+                            line = line.strip()
+                            if line:
+                                yield f"data: {line}\n\n"
+                        initial_size = current_size
+                    else:
+                        # 没有新内容，短暂等待
                         await asyncio.sleep(0.5)
-                        continue
-                    yield f"data: {line}\n\n"
         except asyncio.CancelledError:
             return
+        except Exception as err:
+            logger.error(f"日志读取异常: {err}")
+            yield f"data: 日志读取异常: {err}\n\n"
 
     # 根据length参数返回不同的响应
     if length == -1:
         # 返回全部日志作为文本响应
-        if not log_path.exists():
+        if not await log_path.exists():
             return Response(content="日志文件不存在！", media_type="text/plain")
-        with open(log_path, "r", encoding='utf-8') as file:
-            text = file.read()
-        # 倒序输出
-        text = "\n".join(text.split("\n")[::-1])
-        return Response(content=text, media_type="text/plain")
+        try:
+            # 使用 aiofiles 异步读取文件
+            async with log_path.open(mode="r", encoding="utf-8", errors="ignore") as file:
+                text = await file.read()
+            # 倒序输出
+            text = "\n".join(text.split("\n")[::-1])
+            return Response(content=text, media_type="text/plain")
+        except Exception as e:
+            return Response(content=f"读取日志文件失败: {e}", media_type="text/plain")
     else:
         # 返回SSE流响应
         return StreamingResponse(log_generator(), media_type="text/event-stream")
 
 
 @router.get("/versions", summary="查询Github所有Release版本", response_model=schemas.Response)
-def latest_version(_: schemas.TokenPayload = Depends(verify_token)):
+async def latest_version(_: schemas.TokenPayload = Depends(verify_token)):
     """
     查询Github所有Release版本
     """
-    version_res = RequestUtils(proxies=settings.PROXY, headers=settings.GITHUB_HEADERS).get_res(
+    version_res = await AsyncRequestUtils(proxies=settings.PROXY, headers=settings.GITHUB_HEADERS).get_res(
         f"https://api.github.com/repos/jxxghp/MoviePilot/releases")
     if version_res:
         ver_json = version_res.json()
@@ -453,7 +504,7 @@ def ruletest(title: str,
 
 
 @router.get("/nettest", summary="测试网络连通性")
-def nettest(
+async def nettest(
         url: str,
         proxy: bool,
         include: Optional[str] = None,
@@ -486,7 +537,7 @@ def nettest(
         if settings.PIP_PROXY:
             proxy_name = "PIP加速代理"
     url = url.replace("{TMDBAPIKEY}", settings.TMDB_API_KEY)
-    result = RequestUtils(
+    result = await AsyncRequestUtils(
         proxies=settings.PROXY if proxy else None,
         headers=headers,
         timeout=10,

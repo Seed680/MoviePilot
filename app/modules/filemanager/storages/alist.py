@@ -31,6 +31,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         "move": "移动",
     }
 
+    snapshot_check_folder_modtime = settings.OPENLIST_SNAPSHOT_CHECK_FOLDER_MODTIME
+
     def __init__(self):
         super().__init__()
 
@@ -38,7 +40,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         初始化
         """
-        self.__generate_token.clear_cache()  # noqa
+        self.__generate_token.cache_clear()  # noqa
 
     @property
     def __get_base_url(self) -> str:
@@ -63,9 +65,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         如果设置永久令牌则返回永久令牌
         否则使用账号密码生成临时令牌
         """
-        return self.__generate_token
+        return self.__generate_token()
 
-    @property
     @cached(maxsize=1, ttl=60 * 60 * 24 * 2 - 60 * 5, skip_empty=True)
     def __generate_token(self) -> str:
         """
@@ -127,7 +128,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         检查存储是否可用
         """
-        return True if self.__generate_token else False
+        return True if self.__generate_token() else False
 
     def list(
             self,
@@ -586,6 +587,9 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 data=f,
             )
 
+        if resp is None:
+            logger.warn(f"【OpenList】请求上传文件 {path} 失败")
+            return None
         if resp.status_code != 200:
             logger.warn(f"【OpenList】请求上传文件 {path} 失败，状态码：{resp.status_code}")
             return None
