@@ -95,4 +95,5 @@ if __name__ == '__main__':
     # 更新数据库
     update_db()
     # 启动API服务
-    Server.run()
+    import asyncio
+    asyncio.run(Server.serve())
